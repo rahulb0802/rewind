@@ -1,114 +1,109 @@
 # Rewind SDK
 
-**Transactional runtime for AI agents.** Checkpoint execution, persist state, and rollback from failures with confidence.
-
-> *Give an AI agent the ability to try risky things, fail safely, and resume from a clean state—with no memory of the failure.*
+**A transactional sandbox runtime for AI coding agents.** Run agent-generated code in an isolated container, checkpoint filesystem and conversation state together, and roll both back atomically when something breaks.
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-brightgreen.svg)](https://www.python.org/downloads/)
+
+> **Status:** early prototype. The core engine works and is tested; the framework integration surface is currently LangGraph-only. Treat this as a v0 you can build against, not a finished product. See [Limitations](#known-limitations) before you rely on it.
 
 ---
 
 ## The Problem
 
-AI agents are powerful but fragile. When they fail—bad refactoring, corrupted state, failed tests—everything breaks. There's no rollback. No recovery. You start over, hoping it doesn't happen again.
+Agents that write and execute code need somewhere to do that safely, and a way to recover when they fail. Two specific failures keep coming up:
 
-Building agents that can operate autonomously requires **resilience**. Agents need to try risky operations, learn from failures, and recover cleanly. They need transactions.
+- **Filesystem damage.** An agent edits files, runs a destructive command, or otherwise leaves a workspace in a half-broken state with no way back except git or a manual backup.
+- **Schema corruption after a crash.** When an agent's tool call fails mid-execution, you're often left with an assistant message requesting a tool call that has no matching tool response. Strict providers (Gemini, OpenAI) will reject that message history outright on the next call, even though the failure already happened and you just want to continue.
 
-Rewind brings ACID-like guarantees to agent execution: atomic filesystem + memory state, with instant rollback to any checkpoint.
+Rewind addresses both by tying filesystem snapshots and conversation history to the same checkpoint, so rolling back one always rolls back the other.
 
 ---
 
-## What It Does
+## What It Actually Does
 
-Imagine your agent is refactoring code. It modifies files, runs tests, and the tests fail. With Rewind, your agent doesn't panic—it rolls back to the last checkpoint, tries a different approach, and continues.
+Rewind boots an Alpine Linux Docker container, mounts your host workspace into it **read-only**, and gives the agent a writable OverlayFS layer to work in. Checkpointing is a layer-stacking operation (fast — no file copying), and rollback discards layers back to a chosen point. Separately, it keeps a parallel in-memory record of your conversation messages, snapshotted at the same checkpoint label, so a filesystem rollback and a memory rollback always happen together via one call.
 
 ```python
-from rewind import session
+from rewind_sdk import session
 
-with session("agent", workspace="./src") as sess:
-    sess.checkpoint("before_refactoring")
-    
-    # Agent does risky work
+with session("agent", workspace="./src", auto_commit=True) as sess:
+    sess.checkpoint("stable")
+
     sess.write_file("auth.py", new_implementation)
-    result = sess.run("pytest")
-    
-    # Tests failed? Restore everything.
-    if "FAILED" in result:
-        sess.rollback("before_refactoring")
+    try:
+        sess.run_tests("pytest")
+    except RuntimeError:
+        sess.rollback("stable")
+    # If this block exits without raising and auto_commit=True,
+    # the workspace is streamed back to ./src on the host.
 ```
 
-**Both filesystem and message history are restored together.** No cleanup. No state reconciliation. Just works.
+**Filesystem and message history are restored together, with one call.** That's the actual core mechanic — everything else in this SDK is built around making that pairing convenient.
 
 ---
 
-## Features
+## Verified Features
 
-- **Atomic Checkpoints**: Save filesystem + message state together
-- **Instant Rollback**: Restore to any checkpoint with one call
-- **Auto-Checkpoints**: Automatically snapshot before tool calls
-- **Auto-Rollback**: Recover from failures without explicit error handling
-- **Persistent Memory**: Full conversation history preserved with state
-- **Docker Sandbox**: Isolated execution environment with OverlayFS
-- **Framework Agnostic**: Works with any Python agent framework (LangChain, CrewAI, LangGraph, custom)
-- **Message Format Flexibility**: Support dict, LangChain, LangGraph message formats
+These are implemented and covered by the test suite or directly traceable in source:
+
+- **OverlayFS checkpoints** — instant, layer-based snapshots of the sandbox filesystem (`engine.py`)
+- **Paired memory rollback** — message history is truncated to match a filesystem checkpoint in one call
+- **Dangling tool-call cleanup** — if the checkpoint point falls right after an assistant message that initiated a tool call, that message is automatically dropped too, so you don't hand a broken message history back to a strict-schema provider
+- **Auto-checkpoint before tool calls** — `on_tool_call()` snapshots state automatically when wired into your tool functions
+- **Auto-rollback on exception or test failure** — `auto_rollback("exception", "test_failure", ...)` triggers a rollback automatically inside `run()` / `run_tests()` and inside LangGraph's `invoke`/`stream`
+- **Two-phase commit to host** — host files are only touched if a session block exits without raising and `auto_commit=True` is set; otherwise nothing is written back
+- **LangGraph adapter** — `wrap_langgraph()` wraps a compiled graph's `invoke`/`stream` to keep memory synced and to trigger rollback on unhandled exceptions
+- **CLI and MCP server** — `rewind_cli.py` and `mcp_server.py` expose the same session operations as a command-line tool and as MCP tools, respectively
 
 ---
 
 ## Installation
 
-**Requirements:**
-- Python 3.9+
-- Docker
-- pip
+**Requirements:** Python 3.9+, Docker running locally.
+
+This is not yet published to PyPI. Install from source, editable:
 
 ```bash
-pip install rewind-sdk
-```
-
-**From source:**
-```bash
-git clone https://github.com/yourusername/rewind.git
+git clone <your-repo-url>
 cd rewind
 pip install -e .
+```
+
+```python
+from rewind_sdk import session  # package name is rewind_sdk, not rewind
 ```
 
 ---
 
 ## Quick Start
 
-### Basic Operations
-
 ```python
-from rewind import session
+from rewind_sdk import session
 
 with session("agent", workspace="./workspace") as sess:
-    # Write files
     sess.write_file("script.py", "print('hello')")
-    
-    # Execute commands
-    output = sess.run("python script.py")
-    
-    # Read files
-    content = sess.read_file("script.py")
+    output = sess.run("python3 script.py")
+    print(output)
+# By default destroy_on_exit=True and auto_commit=False:
+# the container is torn down on exit and nothing is written back
+# to ./workspace. Pass auto_commit=True if you want the result persisted.
 ```
 
-### Checkpoints and Rollback
+### Checkpoint and roll back
 
 ```python
-with session("agent", workspace="./src") as sess:
-    # Save state
+with session("agent", workspace="./src", auto_commit=True) as sess:
     sess.checkpoint("stable")
-    
-    # Make changes
-    sess.write_file("config.py", dangerous_changes)
-    sess.run("pytest")
-    
-    # Something went wrong? Restore.
-    sess.rollback("stable")
+
+    sess.write_file("config.py", risky_change)
+    try:
+        sess.run_tests()  # raises RuntimeError on non-zero exit, e.g. pytest failure
+    except RuntimeError:
+        sess.rollback("stable")
 ```
 
-### Persistent Messages
+### Sync conversation memory
 
 ```python
 with session("agent", workspace="./src") as sess:
@@ -116,11 +111,7 @@ with session("agent", workspace="./src") as sess:
         {"role": "user", "content": "Find the bug"},
         {"role": "assistant", "content": "Found it in auth.py"},
     ]
-    
-    # Save messages with state
     sess.sync_memory(messages)
-    
-    # Later, retrieve the full context
     restored = sess.get_messages()
 ```
 
@@ -128,296 +119,126 @@ with session("agent", workspace="./src") as sess:
 
 ## Automated State Management
 
-### Auto-Checkpoints: Never Lose Progress
-
-Automatically create snapshots before operations:
+### Auto-checkpoint
 
 ```python
-with session("agent", workspace="./src") as sess:
-    sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
-    
-    # Each agent step automatically creates a checkpoint
-    agent.run_step()  # ← checkpoint created
-    agent.run_step()  # ← checkpoint created
-    agent.run_step()  # ← checkpoint created
+sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
 ```
 
-**Parameters:**
-- `trigger`: When to checkpoint (`"before_tool_call"`, `"after_tool_call"`, `"before_write"`, `"before_command"`)
-- `keep_last`: Only keep N checkpoints (None = keep all)
+`trigger="before_tool_call"` is the only trigger currently implemented. `keep_last` trims the SDK's own convenience label history (`_auto_labels`) — it does **not** delete the underlying OverlayFS checkpoint layers, which remain on disk regardless of this setting. If you're watching container disk usage, this parameter won't help; there's currently no automatic checkpoint-layer pruning.
 
-### Auto-Rollback: Self-Healing
+Auto-checkpoints only fire where you explicitly call `sess.on_tool_call(...)` — typically from inside your own tool functions, or via the LangGraph adapter's `before_tool_node` hook if you wire it into your graph. It is not a global hook that activates on every tool call without integration.
 
-Automatically recover from failures:
+### Auto-rollback
 
 ```python
-with session("agent", workspace="./src") as sess:
-    sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
-    sess.auto_rollback("exception", "test_failure", to="latest")
-    
-    # If any exception occurs, automatically rollback to last checkpoint
-    # Agent continues without intervention
-    agent.run_step()  # ← Exception? Auto-rollback happens
+sess.auto_rollback("exception", "test_failure", to="latest", test_command="pytest")
 ```
 
-**Track recoveries:**
+Two events are actually implemented: `"exception"` and `"test_failure"`. Both are checked inside `run()`, `run_tests()`, and inside the LangGraph adapter's `invoke`/`stream` exception handling. There is no `"validation_error"` or `"timeout"` event in the current code, despite what you may see suggested elsewhere — if you need either, you'll need to catch it yourself and call `sess.rollback(...)` directly.
+
 ```python
 if sess.last_auto_rollback:
-    event = sess.last_auto_rollback['event']
-    checkpoint = sess.last_auto_rollback['rollback_to']
-    print(f"Recovered from {event} at {checkpoint}")
-```
-
-**Events:**
-- `"exception"`: Any unhandled exception
-- `"test_failure"`: Tests failed (requires `test_command`)
-- `"validation_error"`: Custom validation failed
-- `"timeout"`: Operation timed out
-
----
-
-## Real-World Example: Autonomous Developer
-
-```python
-from rewind import session
-
-class DeveloperAgent:
-    def __init__(self, workspace):
-        self.sess = session("dev", workspace=workspace)
-        self.messages = []
-    
-    def develop_feature(self, spec):
-        # Checkpoint before development
-        self.sess.checkpoint("before_feature")
-        
-        # Generate tests
-        tests = self.llm.generate_tests(spec)
-        self.sess.write_file("test_new_feature.py", tests)
-        self.messages.append({"role": "assistant", "content": "Tests generated"})
-        
-        # Generate implementation
-        impl = self.llm.generate_implementation(spec)
-        self.sess.write_file("new_feature.py", impl)
-        self.messages.append({"role": "assistant", "content": "Implementation done"})
-        
-        # Save state
-        self.sess.sync_memory(self.messages)
-        
-        # Test it
-        try:
-            result = self.sess.run("pytest test_new_feature.py")
-            self.sess.checkpoint("feature_complete")
-            print(f"✅ Feature complete: {spec}")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Tests failed, trying different approach...")
-            
-            # Rollback and try again
-            self.sess.rollback("before_feature")
-            self.messages = self.sess.get_messages()
-            
-            # Alternative implementation
-            impl_v2 = self.llm.generate_simpler_implementation(spec)
-            self.sess.write_file("new_feature.py", impl_v2)
-            
-            # Test again
-            result = self.sess.run("pytest test_new_feature.py")
-            self.sess.checkpoint("feature_complete")
-            print(f"✅ Feature complete with simpler approach")
-            return True
-
-# Usage
-with DeveloperAgent(workspace="./myapp") as agent:
-    agent.develop_feature("Add JWT authentication")
-    agent.develop_feature("Add rate limiting")
-    agent.develop_feature("Add request logging")
+    print(sess.last_auto_rollback["event"], sess.last_auto_rollback["to"])
 ```
 
 ---
 
-## Integration Examples
-
-### LangChain Agent
+## LangGraph Integration
 
 ```python
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_openai import ChatOpenAI
-from rewind import session
+import threading
+from rewind_sdk import session, wrap_langgraph
 
-with session("langchain_agent", workspace="./project") as sess:
-    sess.auto_checkpoint(trigger="before_tool_call", keep_last=5)
-    sess.auto_rollback("exception", to="latest")
-    
-    llm = ChatOpenAI(model="gpt-4")
-    agent = create_react_agent(llm, tools)
-    executor = AgentExecutor(agent=agent, tools=tools)
-    
-    result = executor.invoke({"input": "Refactor the authentication system"})
+tool_lock = threading.Lock()
+sandbox = session("agent_sandbox", workspace="./my_codebase", auto_commit=True)
+
+@tool
+def write_file(path: str, content: str) -> str:
+    with tool_lock:
+        sandbox.on_tool_call(tool_name="write_file")  # explicit checkpoint trigger
+        sandbox.write_file(path, content)
+        return f"Wrote to {path}"
+
+with sandbox:
+    sandbox.auto_checkpoint(trigger="before_tool_call")
+    sandbox.auto_rollback("exception", to="latest")
+
+    safe_agent = wrap_langgraph(base_agent, session=sandbox)
+    for event in safe_agent.stream({"messages": messages}):
+        pass
 ```
 
-### CrewAI Team
+**What this buys you:** your system prompt doesn't need to mention rollbacks, checkpoints, or recovery — the message-history correction happens in `memory.py`, not in the prompt. **What it doesn't do automatically:** checkpointing before each tool call still requires you to call `sandbox.on_tool_call(...)` inside your tool implementations, as shown above. The adapter keeps memory synced and catches unhandled exceptions from `invoke`/`stream`, but it does not instrument your tools for you.
 
-```python
-from crewai import Agent, Task, Crew
-from rewind import session
+A thread lock around tool execution is recommended (and used above) because the sandbox is a single container — concurrent writes from parallel tool calls aren't serialized for you.
 
-with session("crew_team", workspace="./codebase") as sess:
-    sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
-    sess.auto_rollback("exception", to="latest")
-    
-    reviewer = Agent(role="Code Reviewer", tools=[read_file, write_file])
-    refactorer = Agent(role="Refactorer", tools=[write_file, run_tests])
-    
-    crew = Crew(
-        agents=[reviewer, refactorer],
-        tasks=[
-            Task(description="Review auth.py", agent=reviewer),
-            Task(description="Fix issues", agent=refactorer),
-        ]
-    )
-    
-    result = crew.kickoff()
+---
+
+## CLI
+
+```bash
+python rewind_cli.py init ./my-project
+python rewind_cli.py write src/app.py "print('hi')"
+python rewind_cli.py checkpoint stable
+python rewind_cli.py exec "pytest"
+python rewind_cli.py rollback stable
+python rewind_cli.py status
+python rewind_cli.py destroy
 ```
+
+Add `--json` for machine-readable output and `--quiet` to suppress stderr logging — useful if another agent is driving the CLI directly.
+
+## MCP Server
+
+`mcp_server.py` exposes session operations (`init_sandbox`, `execute_sandbox_command`, `write_sandbox_file`, `read_sandbox_file`, `sync_agent_memory`, `create_sandbox_checkpoint`, `rollback_sandbox_state`, `configure_auto_checkpoint`, `configure_auto_rollback`, `get_sandbox_status`) as MCP tools, for clients that want to drive a Rewind sandbox without writing Python. Requires `pip install mcp`.
+
+---
+
+## Known Limitations
+
+Being direct about these now is better than someone finding them the hard way:
+
+- **Containers run `--privileged`.** This is required for the current OverlayFS mounting approach, but it means the sandbox container has broad host-kernel access — it is not a hardened security boundary against a determined adversary. Treat it as protection against an agent's *accidental* mistakes (bad refactors, destructive commands), not as isolation against malicious code.
+- **One framework integration.** Only LangGraph is supported today. The adapter pattern (`messages_to_dicts` / `dicts_to_messages`) is framework-agnostic in design, but no LangChain-only or CrewAI adapter exists yet.
+- **Not on PyPI.** Install from source only, for now.
+- **No automatic concurrency control inside the SDK.** If you call sandbox methods from multiple threads, you need your own lock (see the LangGraph example above) — the SDK does not serialize for you.
+- **Auto-checkpoint requires manual wiring.** `on_tool_call()` needs to be called from your own tool code; it isn't injected automatically into arbitrary agent frameworks.
+- **Only two auto-rollback events implemented:** `exception` and `test_failure`. Anything else needs a manual `sess.rollback(...)` call.
+- **`keep_last` doesn't free disk space.** It trims label bookkeeping, not the underlying checkpoint layers.
+- **Default behavior discards work.** With default arguments (`destroy_on_exit=True`, `auto_commit=False`), exiting a `with session(...)` block destroys the container and writes nothing back to the host. Pass `auto_commit=True` explicitly if you want results persisted.
+- **Untested against nested/concurrent tool-call crashes.** The dangling-tool-call cleanup handles the single-message case (one assistant tool-call message immediately before the checkpoint). Behavior under deeper crash scenarios hasn't been verified.
 
 ---
 
 ## API Reference
 
-### Session Initialization
-
 ```python
-from rewind import session
+session(name="rewind_sandbox", workspace=".", *, container_name=None,
+        engine=None, memory=None, destroy_on_exit=True, auto_commit=False)
 
-sess = session(
-    name: str,                      # Session identifier
-    workspace: str,                 # Working directory
-    container_name: str = None,     # Docker container name (auto-generated)
-    destroy_on_exit: bool = True    # Auto-cleanup
-)
-```
+sess.write_file(path, content)
+sess.read_file(path) -> str
+sess.run(cmd) -> str                  # raises RuntimeError on non-zero exit
+sess.run_tests(cmd=None) -> str       # defaults to "pytest"
 
-### File Operations
+sess.sync_memory(messages, message_format="auto")
+sess.get_messages(message_format="auto") -> list
 
-```python
-sess.write_file(path: str, content: str)     # Write file
-sess.read_file(path: str) -> str             # Read file
-sess.run(command: str) -> str                # Execute command
-```
+sess.checkpoint(label, messages=None) -> str
+sess.rollback(label="latest", patch_notes=None, message_format="auto") -> list
 
-### Memory Operations
+sess.auto_checkpoint(trigger="before_tool_call", keep_last=None)
+sess.auto_rollback(*events, to="latest", test_command=None)
 
-```python
-sess.sync_memory(messages: list, message_format="auto")  # Persist messages
-sess.get_messages(message_format="auto") -> list         # Retrieve messages
-```
+sess.on_tool_call(messages=None, tool_name=None)
+sess.on_tool_result(messages=None, error=None)
 
-### Checkpointing
-
-```python
-sess.checkpoint(label: str, messages=None) -> str        # Create checkpoint
-sess.rollback(label: str = "latest", patch_notes=None)   # Restore state
-```
-
-### Automatic Management
-
-```python
-sess.auto_checkpoint(
-    trigger: str = "before_tool_call",  # "before_tool_call", "after_tool_call", "before_write", "before_command"
-    keep_last: int = None               # Keep only N checkpoints (None = keep all)
-) -> RewindSession
-
-sess.auto_rollback(
-    *events: str,                       # "exception", "test_failure", etc.
-    to: str = "latest",                 # Where to rollback: "latest" or "checkpoint_name"
-    test_command: str = None            # For detecting test failures
-) -> RewindSession
-```
-
-### Session Management
-
-```python
-sess.start(workspace=None, force=False)     # Initialize sandbox
-sess.attach()                               # Load existing session
-sess.destroy()                              # Cleanup
-sess.status() -> dict                       # Get session info
-```
-
-### Query State
-
-```python
-sess.memory.checkpoints() -> list           # Get all checkpoint labels
-sess.memory.latest_label() -> str           # Get latest checkpoint
-sess.memory.get_messages() -> list          # Get all messages
-```
-
----
-
-## Best Practices
-
-### ✅ Do
-
-```python
-# 1. Use context managers for automatic cleanup
-with session("agent", workspace="./work") as sess:
-    # ... use session ...
-    pass
-
-# 2. Checkpoint before risky operations
-sess.checkpoint("before_major_change")
-sess.run("destructive_operation")
-
-# 3. Keep messages in sync
-messages.append({"role": "assistant", "content": result})
-sess.sync_memory(messages)
-
-# 4. Use auto-triggers for resilience
-sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
-sess.auto_rollback("exception", to="latest")
-
-# 5. Label checkpoints meaningfully
-sess.checkpoint("tests_passing")
-sess.checkpoint("before_refactoring")
-```
-
-### ❌ Don't
-
-```python
-# Manual cleanup - easy to leak containers
-sess = session("agent")
-sess.start()
-# ... forgot to sess.destroy()
-
-# Sync messages inconsistently
-sess.run("command")
-# ... forgot to sync_memory()
-
-# Keep unlimited checkpoints
-sess.auto_checkpoint(keep_last=None)  # Will consume lots of memory
-
-# Vague checkpoint labels
-sess.checkpoint("cp1")
-sess.checkpoint("cp2")
-```
-
----
-
-## Configuration
-
-### Environment Variables
-
-```bash
-REWIND_DEBUG=true                   # Enable debug logging
-REWIND_WORKSPACE=/path/to/work      # Default workspace directory
-```
-
-### Python Configuration
-
-```python
-from rewind.engine import SandboxEngine
-
-engine = SandboxEngine(container_name="my_custom_name")
-sess = session("agent", engine=engine)
+sess.start(workspace=None, force=False)
+sess.attach()
+sess.destroy()
+sess.status() -> dict
+sess.commit()                         # manual host export; auto_commit calls this on clean exit
 ```
 
 ---
@@ -425,27 +246,20 @@ sess = session("agent", engine=engine)
 ## Troubleshooting
 
 | Issue | Solution |
-|-------|----------|
-| Docker not running | Run `docker version` or start Docker Desktop |
-| "Container already exists" | Use `sess.start(force=True)` or `sess.destroy()` first |
-| High memory usage | Reduce `keep_last` in auto-checkpoint or manually clear old checkpoints |
-| OverlayFS sync errors | Run `sess.destroy()` and `sess.start()` to reset |
+|---|---|
+| Docker not running | `docker version` should return cleanly, or start Docker Desktop |
+| `RuntimeError: Session not started` | Use `with session(...)` or call `.start()` first |
+| Work disappeared after the `with` block | Default `auto_commit=False` — pass `auto_commit=True` |
+| `"Checkpoint X already exists"` | Checkpoint labels must be unique per session; pick a new label |
 
 ---
 
 ## Contact
 
-Built by a solo developer. Questions, feedback, or issues?
+Built by a solo developer. Feedback and bug reports welcome.
 
-**Email:** hello@example.com  
-**Twitter:** [@your-handle](https://twitter.com/your-handle)  
-
----
+**Email:** rewind.sdk.dev@protonmail.com
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
----
-
-*Rewind: Transactional runtime for AI agents.*
+MIT — see [LICENSE](LICENSE).
