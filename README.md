@@ -65,7 +65,7 @@ These are implemented and covered by the test suite or directly traceable in sou
 This is not yet published to PyPI. Install from source, editable:
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/rahulb0802/rewind.git
 cd rewind
 pip install -e .
 ```
