@@ -5,8 +5,39 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "rewind_sdk"
 version = "0.2.0"
-description = "Transactional runtime for AI agents"
+description = "Transactional runtime for AI agents. Pairs filesystem and conversation-memory rollback in one checkpoint."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Rahul Sai Billakanti", email = "rewind.sdk.dev@protonmail.com"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = []
+
+[project.optional-dependencies]
+langgraph = [
+    "langchain-core",
+    "langgraph"
+]
+mcp = [
+    "mcp"
+]
+
+[project.urls]
+Homepage = "https://rewind-sdk.vercel.app/"
+Repository = "https://github.com/rahulb0802/rewind-sdk"
+Issues = "https://github.com/rahulb0802/rewind-sdk/issues"
 
 [tool.setuptools]
 packages = ["rewind_sdk"]
