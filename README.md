@@ -201,7 +201,6 @@ Being direct about these now is better than someone finding them the hard way:
 
 - **Containers run `--privileged`.** This is required for the current OverlayFS mounting approach, but it means the sandbox container has broad host-kernel access — it is not a hardened security boundary against a determined adversary. Treat it as protection against an agent's *accidental* mistakes (bad refactors, destructive commands), not as isolation against malicious code.
 - **One framework integration.** Only LangGraph is supported today. The adapter pattern (`messages_to_dicts` / `dicts_to_messages`) is framework-agnostic in design, but no LangChain-only or CrewAI adapter exists yet.
-- **Not on PyPI.** Install from source only, for now.
 - **No automatic concurrency control inside the SDK.** If you call sandbox methods from multiple threads, you need your own lock (see the LangGraph example above) — the SDK does not serialize for you.
 - **Auto-checkpoint requires manual wiring.** `on_tool_call()` needs to be called from your own tool code; it isn't injected automatically into arbitrary agent frameworks.
 - **Only two auto-rollback events implemented:** `exception` and `test_failure`. Anything else needs a manual `sess.rollback(...)` call.
