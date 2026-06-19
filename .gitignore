@@ -1,8 +1,4 @@
 .env
 __pycache__/
 .pytest_cache/
-test_base/
-rewind_sdk.egg-info/
-debug_fs.py
-run_db_agent.py
 legacy_reference/
