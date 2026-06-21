@@ -6,6 +6,15 @@ def _message_classes():
     return AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 
+def _verification_halt_error_class():
+    """Late import to avoid a circular dependency at module load time."""
+    try:
+        from ..verification import VerificationHaltError
+        return VerificationHaltError
+    except Exception:
+        return None
+
+
 def messages_to_dicts(messages):
     dicts = []
     for message in messages or []:
@@ -91,6 +100,9 @@ class RewindLangGraph:
         try:
             result = self.graph.invoke(state, *args, **kwargs)
         except Exception as exc:
+            HaltError = _verification_halt_error_class()
+            if HaltError is not None and isinstance(exc, HaltError):
+                raise
             self.session.on_tool_result(error=exc)
             raise
         self._update_memory(result)
@@ -108,6 +120,9 @@ class RewindLangGraph:
                         self._update_memory({"messages": node_state["messages"]})
                 yield event
         except Exception as exc:
+            HaltError = _verification_halt_error_class()
+            if HaltError is not None and isinstance(exc, HaltError):
+                raise
             self.session.on_tool_result(error=exc)
             raise
 

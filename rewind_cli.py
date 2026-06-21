@@ -5,6 +5,7 @@ import os
 import sys
 
 from rewind_sdk import RewindSession
+from rewind_sdk.verification import VerificationHaltError
 
 
 EXIT_SUCCESS = 0
@@ -71,6 +72,16 @@ class AgentNativeCLI:
         self._ensure_attached()
         try:
             self.log_result(self.session.run(cmd))
+        except VerificationHaltError as exc:
+            msg = (
+                f"Execution halted by verifier.\n"
+                f"  Checkpoint : {exc.checkpoint or 'none'}\n"
+                f"  Command    : {exc.verifier_command if isinstance(exc.verifier_command, str) else ' '.join(exc.verifier_command)}\n"
+                f"  Details    : {exc.last_result.notes or 'none'}\n"
+                "The sandbox container is still alive. Inspect it, fix the verifier, "
+                "then re-run your script to resume."
+            )
+            self.log_error(msg, EXIT_ERROR_GENERIC)
         except Exception as exc:
             self.log_error(f"Execution failed: {exc}", EXIT_ERROR_DOCKER_FAILURE)
 
@@ -123,6 +134,46 @@ class AgentNativeCLI:
         self.session.destroy()
         self.log_result("SUCCESS: Sandbox destroyed")
 
+    def cmd_ledger(self, checkpoint=None):
+        self._ensure_attached()
+        if checkpoint:
+            entries = self.session.ledger.by_checkpoint(checkpoint)
+        else:
+            entries = self.session.ledger.history()
+
+        serialised = [
+            {
+                "timestamp": e.timestamp,
+                "event_type": e.event_type,
+                "status": e.status,
+                "checkpoint": e.checkpoint,
+                "raw_output": e.raw_output,
+                "notes": e.notes,
+                "resolution": e.resolution,
+            }
+            for e in entries
+        ]
+
+        if self.use_json:
+            print(json.dumps({"success": True, "data": serialised}))
+            return
+
+        if not serialised:
+            print("No ledger entries recorded in this session.")
+            return
+
+        for i, entry in enumerate(serialised, 1):
+            print(f"--- Entry {i} ---")
+            print(f"  timestamp  : {entry['timestamp']}")
+            print(f"  event_type : {entry['event_type']}")
+            print(f"  status     : {entry['status'] or '-'}")
+            print(f"  checkpoint : {entry['checkpoint'] or '-'}")
+            print(f"  resolution : {entry['resolution'] or '-'}")
+            if entry["notes"]:
+                print(f"  notes      : {entry['notes']}")
+            if entry["raw_output"]:
+                print(f"  raw_output : {json.dumps(entry['raw_output'])}")
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -164,6 +215,11 @@ AGENT INTEGRATION GUIDE:
     subparsers.add_parser("status", help="Query layer depth and usage")
     subparsers.add_parser("destroy", help="Destroy sandbox")
 
+    parser_ledger = subparsers.add_parser("ledger", help="Show verification ledger history")
+    parser_ledger.add_argument(
+        "--checkpoint", default=None, help="Filter entries by checkpoint label"
+    )
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -187,6 +243,8 @@ AGENT INTEGRATION GUIDE:
         cli.cmd_status()
     elif args.command == "destroy":
         cli.cmd_destroy()
+    elif args.command == "ledger":
+        cli.cmd_ledger(checkpoint=getattr(args, "checkpoint", None))
 
 
 if __name__ == "__main__":

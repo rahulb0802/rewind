@@ -9,10 +9,11 @@ except ImportError:
     sys.exit(1)
 
 from rewind_sdk import RewindSession
+from rewind_sdk.verification import stop_escalation_handler
 
 
 mcp = FastMCP("Rewind Sandbox Server")
-session = RewindSession(destroy_on_exit=False)
+session = RewindSession(destroy_on_exit=False, escalation_handler=stop_escalation_handler)
 
 
 def _as_json(data, success=True):
@@ -44,7 +45,7 @@ def init_sandbox(path: str, container_name: str = "rewind_sandbox") -> str:
     Initializes a new sandbox at the specified host path.
     """
     global session
-    session = RewindSession(container_name=container_name, destroy_on_exit=False)
+    session = RewindSession(container_name=container_name, destroy_on_exit=False, escalation_handler=stop_escalation_handler)
     try:
         session.start(path, force=False)
         return _as_json(session.status())
@@ -228,6 +229,39 @@ def get_sandbox_status() -> str:
         return error
     try:
         return _as_json(session.status())
+    except Exception as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_ledger_history(checkpoint: str | None = None) -> str:
+    """
+    Returns the verification ledger history for this session.
+
+    Pass a checkpoint label to filter entries to that checkpoint only.
+    The ledger is append-only and survives rollbacks — it records every
+    verification event, escalation resolution, and automatic rollback taken
+    during this session.
+    """
+    try:
+        if checkpoint:
+            entries = session.ledger.by_checkpoint(checkpoint)
+        else:
+            entries = session.ledger.history()
+
+        serialised = [
+            {
+                "timestamp": e.timestamp,
+                "event_type": e.event_type,
+                "status": e.status,
+                "checkpoint": e.checkpoint,
+                "raw_output": e.raw_output,
+                "notes": e.notes,
+                "resolution": e.resolution,
+            }
+            for e in entries
+        ]
+        return _as_json({"entries": serialised, "count": len(serialised)})
     except Exception as exc:
         return _error(str(exc))
 

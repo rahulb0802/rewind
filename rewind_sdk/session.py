@@ -6,6 +6,17 @@ from dataclasses import dataclass
 from .adapters.langgraph import dicts_to_messages, infer_message_format, messages_to_dicts
 from .engine import SandboxEngine
 from .memory import MemoryStore
+from .verification import (
+    EscalationContext,
+    EscalationHandler,
+    EscalationResolution,
+    VerificationHaltError,
+    VerificationLedger,
+    VerificationStatus,
+    VerifierConfig,
+    run_verifier,
+    stdin_escalation_handler,
+)
 
 
 @dataclass
@@ -19,6 +30,7 @@ class AutoRollbackConfig:
     events: set[str]
     to: str = "latest"
     test_command: str | None = None
+    verifier: VerifierConfig | None = None
 
 
 class RewindSession:
@@ -34,6 +46,7 @@ class RewindSession:
         memory=None,
         destroy_on_exit=True,
         auto_commit=False,
+        escalation_handler: EscalationHandler | None = None,
     ):
         self.name = container_name or name
         self.workspace = workspace
@@ -48,6 +61,10 @@ class RewindSession:
         self.last_auto_rollback = None
         self._started = False
         self.auto_commit = auto_commit
+        self._escalation_handler: EscalationHandler = escalation_handler or stdin_escalation_handler
+        # Durable ledger: lives outside both engine and memory rollback scopes.
+        # rollback() never touches this attribute.
+        self.ledger = VerificationLedger()
 
     def __enter__(self):
         self.start(force=True)
@@ -274,6 +291,70 @@ class RewindSession:
     def _maybe_auto_rollback(self, event, patch_notes=None):
         if not self._auto_rollback or event not in self._auto_rollback.events:
             return None
+
+        verifier = self._auto_rollback.verifier
+        if verifier is None:
+            # Backward-compatible path: no verifier configured, rollback immediately.
+            return self._execute_rollback(event, patch_notes)
+
+        result, attempts = self._run_verifier_with_retries(verifier)
+
+        try:
+            checkpoint_label = self._resolve_label(self._auto_rollback.to)
+        except ValueError:
+            checkpoint_label = None
+
+        if result.status == VerificationStatus.PASS:
+            self.ledger.record_verification(
+                status=result.status,
+                checkpoint=checkpoint_label,
+                raw_output=result.raw_output,
+                notes=result.notes,
+            )
+            return None
+
+        if result.status == VerificationStatus.FAIL:
+            self.ledger.record_verification(
+                status=result.status,
+                checkpoint=checkpoint_label,
+                raw_output=result.raw_output,
+                notes=result.notes,
+            )
+            return self._execute_rollback(event, patch_notes)
+
+        # UNKNOWN after all retries exhausted.
+        return self._handle_unknown_escalation(event, patch_notes, result, attempts, checkpoint_label)
+
+    def _run_verifier_with_retries(self, config: VerifierConfig):
+        """Run the verifier, retrying on UNKNOWN with backoff.
+
+        Returns (VerificationResult, total_attempts).
+        """
+        total = config.retries + 1
+        for attempt in range(1, total + 1):
+            result = run_verifier(config)
+            if result.status != VerificationStatus.UNKNOWN:
+                return result, attempt
+            if attempt < total:
+                print(
+                    f"[rewind] Verifier returned unknown "
+                    f"(attempt {attempt}/{total}), retrying in {config.retry_delay}s..."
+                )
+                time.sleep(config.retry_delay)
+            else:
+                print(
+                    f"[rewind] Verifier exhausted {config.retries} retries, "
+                    "still unknown. Escalating to human decision point..."
+                )
+        return result, total
+
+    def _execute_rollback(self, event, patch_notes, result=None):
+        """Perform the actual filesystem + memory rollback and update session state."""
+        try:
+            checkpoint_label = self._resolve_label(self._auto_rollback.to)
+        except ValueError:
+            checkpoint_label = None
+
         try:
             messages = self.rollback(
                 self._auto_rollback.to,
@@ -288,12 +369,56 @@ class RewindSession:
                 stacklevel=2,
             )
             return None
+
+        self.ledger.record_rollback(
+            checkpoint=checkpoint_label,
+            notes=patch_notes or f"Automatic rollback triggered by {event}.",
+        )
         self.last_auto_rollback = {
             "event": event,
             "to": self._auto_rollback.to,
             "messages": messages,
         }
         return messages
+
+    def _handle_unknown_escalation(self, event, patch_notes, result, attempts, checkpoint_label):
+        """Dispatch to the escalation handler and act on its resolution."""
+        cmd = self._auto_rollback.verifier.command
+        ctx = EscalationContext(
+            checkpoint=checkpoint_label,
+            verifier_command=cmd,
+            last_result=result,
+            attempts=attempts,
+            session_name=self.name,
+        )
+        resolution = self._escalation_handler(ctx)
+
+        self.ledger.record_escalation(
+            status=result.status,
+            checkpoint=checkpoint_label,
+            raw_output=result.raw_output,
+            notes=result.notes,
+            resolution=resolution,
+        )
+
+        if resolution == EscalationResolution.CONTINUE:
+            return None
+
+        if resolution == EscalationResolution.ROLLBACK:
+            return self._execute_rollback(event, patch_notes)
+
+        # STOP: surface what the developer needs to manually recover.
+        cmd_display = cmd if isinstance(cmd, str) else " ".join(cmd)
+        raise VerificationHaltError(
+            f"[rewind] Execution halted — verifier returned UNKNOWN after {attempts} attempt(s).\n"
+            f"  Checkpoint : {checkpoint_label or 'none'}\n"
+            f"  Command    : {cmd_display}\n"
+            f"  Details    : {result.notes or 'none'}\n"
+            "Sandbox container is still alive. Fix the verifier and re-run your script to resume.",
+            checkpoint=checkpoint_label,
+            verifier_command=cmd,
+            last_result=result,
+        )
 
     def _default_test_command(self):
         if self._auto_rollback and self._auto_rollback.test_command:
@@ -307,6 +432,10 @@ class RewindSession:
         joined = " ".join(str(part) for part in cmd)
         return configured in joined or "pytest" in joined or "unittest" in joined
     
+    def get_ledger(self) -> VerificationLedger:
+        """Return the durable ledger; survives rollback() calls."""
+        return self.ledger
+
     def commit(self):
         """Commits the sandbox workspace state back to the host machine."""
         self._ensure_ready()
