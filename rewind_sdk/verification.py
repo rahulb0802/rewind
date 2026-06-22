@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import datetime
 import json
-import subprocess
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
@@ -47,7 +46,7 @@ class VerificationResult:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class VerifierConfig:
+class Verifier:
     """Mirrors the AutoCheckpointConfig / AutoRollbackConfig dataclass style."""
     command: str | list[str]
     retries: int = 3
@@ -235,41 +234,6 @@ def parse_verifier_output(stdout: str, stderr: str) -> VerificationResult:
             raw_output={"raw_stdout": stdout, "raw_stderr": stderr},
             notes=f"Could not parse verifier output: {exc}",
         )
-
-
-def run_verifier(config: VerifierConfig) -> VerificationResult:
-    """
-    Execute a verifier command and parse its structured JSON output.
-
-    Returns UNKNOWN for any of:
-    - the process crashes or cannot be started
-    - the timeout expires
-    - stdout cannot be parsed as a JSON object
-    - the ``status`` field is missing or unrecognised
-    """
-    cmd = config.command
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=config.timeout,
-            shell=isinstance(cmd, str),
-        )
-    except subprocess.TimeoutExpired:
-        return VerificationResult(
-            status=VerificationStatus.UNKNOWN,
-            raw_output={},
-            notes=f"Verifier timed out after {config.timeout}s",
-        )
-    except Exception as exc:
-        return VerificationResult(
-            status=VerificationStatus.UNKNOWN,
-            raw_output={},
-            notes=f"Verifier failed to start: {exc}",
-        )
-
-    return parse_verifier_output(res.stdout, res.stderr)
 
 
 # ---------------------------------------------------------------------------

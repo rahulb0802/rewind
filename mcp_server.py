@@ -9,7 +9,7 @@ except ImportError:
     sys.exit(1)
 
 from rewind_sdk import RewindSession
-from rewind_sdk.verification import VerifierConfig, stop_escalation_handler
+from rewind_sdk.verification import Verifier, stop_escalation_handler
 
 
 mcp = FastMCP("Rewind Sandbox Server")
@@ -136,7 +136,6 @@ def configure_auto_checkpoint(trigger: str = "before_tool_call", keep_last: int 
 def configure_auto_rollback(
     events_json: str = '["exception"]',
     to: str = "latest",
-    test_command: str | None = None,
     verifier_json: str | None = None,
 ) -> str:
     """
@@ -144,7 +143,7 @@ def configure_auto_rollback(
 
     events_json should decode to a list such as ["test_failure", "exception"].
     verifier_json, when set, should decode to a dict with keys command (required),
-    and optional retries, retry_delay, timeout — same fields as VerifierConfig.
+    and optional retries, retry_delay, timeout — same fields as Verifier.
     """
     try:
         events = json.loads(events_json)
@@ -157,17 +156,16 @@ def configure_auto_rollback(
             verifier_data = json.loads(verifier_json)
             if not isinstance(verifier_data, dict) or "command" not in verifier_data:
                 return _error('verifier_json must decode to a dict with a "command" key.')
-            verifier = VerifierConfig(
+            verifier = Verifier(
                 command=verifier_data["command"],
                 retries=verifier_data.get("retries", 3),
                 retry_delay=verifier_data.get("retry_delay", 2.0),
                 timeout=verifier_data.get("timeout", 30.0),
             )
-        session.auto_rollback(*events, to=to, test_command=test_command, verifier=verifier)
+        session.auto_rollback(*events, to=to, verifier=verifier)
         return _as_json({
             "events": events,
             "to": to,
-            "test_command": test_command,
             "verifier": verifier_json,
         })
     except Exception as exc:

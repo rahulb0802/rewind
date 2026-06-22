@@ -15,9 +15,8 @@ from .verification import (
     VerificationLedger,
     VerificationResult,
     VerificationStatus,
-    VerifierConfig,
+    Verifier,
     parse_verifier_output,
-    run_verifier,
     stdin_escalation_handler,
 )
 
@@ -32,8 +31,7 @@ class AutoCheckpointConfig:
 class AutoRollbackConfig:
     events: set[str]
     to: str = "latest"
-    test_command: str | None = None
-    verifier: VerifierConfig | None = None
+    verifier: Verifier | None = None
 
 
 class RewindSession:
@@ -119,25 +117,22 @@ class RewindSession:
 
     def run(self, cmd):
         self._ensure_ready()
-        if self._auto_rollback and self._auto_rollback.verifier and self._looks_like_test_command(cmd):
-            return self._run_verified_container_cmd(cmd, "test_failure")
         try:
             return self.engine.run_cmd(cmd)
         except Exception as exc:
-            event = "test_failure" if self._looks_like_test_command(cmd) else "exception"
-            self._maybe_auto_rollback(event, patch_notes=str(exc))
+            self._maybe_auto_rollback("exception", patch_notes=str(exc))
             raise
 
     def run_tests(self, cmd=None):
-        command = cmd or self._default_test_command()
+        command = cmd or (
+            self._auto_rollback.verifier.command
+            if self._auto_rollback and self._auto_rollback.verifier
+            else None
+        )
         self._ensure_ready()
         if self._auto_rollback and self._auto_rollback.verifier:
             return self._run_verified_container_cmd(command, "test_failure")
-        try:
-            return self.engine.run_cmd(command)
-        except Exception as exc:
-            self._maybe_auto_rollback("test_failure", patch_notes=str(exc))
-            raise
+        return self.engine.run_cmd(command)
 
     def write_file(self, path, content):
         self._ensure_ready()
@@ -186,13 +181,13 @@ class RewindSession:
         self._auto_checkpoint = AutoCheckpointConfig(trigger=trigger, keep_last=keep_last)
         return self
 
-    def auto_rollback(self, *events, on=None, to=None, test_command=None, verifier=None):
+    def auto_rollback(self, *events, on=None, to=None, verifier=None):
         """Configure automatic rollback behavior on specified events.
 
-        When ``verifier`` is set, ``run_tests()`` and test-like ``run()`` calls
-        execute ``test_command`` in the sandbox once and treat JSON stdout as the
-        authoritative pass/fail/unknown signal. ``VerifierConfig`` controls retries,
-        timeout, and escalation; ``test_command`` is the in-container command.
+        When ``verifier`` is set, ``run_tests()`` executes ``verifier.command``
+        in the sandbox and treats JSON stdout as the authoritative
+        pass/fail/unknown signal. ``Verifier`` controls retries, timeout, and
+        escalation.
 
         IMPORTANT:
         `to` should almost always be an explicit checkpoint label you
@@ -229,7 +224,6 @@ class RewindSession:
         self._auto_rollback = AutoRollbackConfig(
             events=selected_events,
             to=to,
-            test_command=test_command,
             verifier=verifier,
         )
         return self
@@ -306,15 +300,10 @@ class RewindSession:
         if not self._auto_rollback or event not in self._auto_rollback.events:
             return None
 
-        verifier = self._auto_rollback.verifier
-        if verifier is None:
-            # Backward-compatible path: no verifier configured, rollback immediately.
+        if _pre_result is None:
             return self._execute_rollback(event, patch_notes)
 
-        if _pre_result is not None:
-            result, attempts = _pre_result, _pre_attempts
-        else:
-            result, attempts = self._run_verifier_with_retries(verifier)
+        result, attempts = _pre_result, _pre_attempts
 
         try:
             checkpoint_label = self._resolve_label(self._auto_rollback.to)
@@ -341,29 +330,6 @@ class RewindSession:
 
         # UNKNOWN after all retries exhausted.
         return self._handle_unknown_escalation(event, patch_notes, result, attempts, checkpoint_label)
-
-    def _run_verifier_with_retries(self, config: VerifierConfig):
-        """Run the verifier, retrying on UNKNOWN with backoff.
-
-        Returns (VerificationResult, total_attempts).
-        """
-        total = config.retries + 1
-        for attempt in range(1, total + 1):
-            result = run_verifier(config)
-            if result.status != VerificationStatus.UNKNOWN:
-                return result, attempt
-            if attempt < total:
-                print(
-                    f"[rewind] Verifier returned unknown "
-                    f"(attempt {attempt}/{total}), retrying in {config.retry_delay}s..."
-                )
-                time.sleep(config.retry_delay)
-            else:
-                print(
-                    f"[rewind] Verifier exhausted {config.retries} retries, "
-                    "still unknown. Escalating to human decision point..."
-                )
-        return result, total
 
     def _run_container_verifier_with_retries(self, cmd):
         """Run a command in-container, parse JSON stdout, retry on UNKNOWN.
@@ -497,18 +463,6 @@ class RewindSession:
             last_result=result,
         )
 
-    def _default_test_command(self):
-        if self._auto_rollback and self._auto_rollback.test_command:
-            return self._auto_rollback.test_command
-        return "pytest"
-
-    def _looks_like_test_command(self, cmd):
-        configured = self._default_test_command()
-        if isinstance(cmd, str):
-            return configured in cmd or "pytest" in cmd or "unittest" in cmd
-        joined = " ".join(str(part) for part in cmd)
-        return configured in joined or "pytest" in joined or "unittest" in joined
-    
     def get_ledger(self) -> VerificationLedger:
         """Return the durable ledger; survives rollback() calls."""
         return self.ledger
