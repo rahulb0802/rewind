@@ -2,13 +2,15 @@
 Tests for the verification/ledger/escalation system.
 
 All tests use FakeEngine (no Docker) so they run offline in CI.
-The six scenarios cover:
+The thirteen scenarios cover:
   1. Verifier recovers on retry (UNKNOWN → UNKNOWN → PASS)
   2. Retries exhausted → CONTINUE resolution
   3. Retries exhausted → ROLLBACK resolution
   4. Retries exhausted → STOP resolution (VerificationHaltError)
   5. Ledger entries survive a rollback() call
-  6. Backward-compat: no verifier configured → old pass/fail binary behaviour
+  6. Backward-compatibility: no verifier configured → old pass/fail binary behaviour
+  7–9. parse_verifier_output: pass, fail, unknown (bad JSON)
+  10–12. run_tests in-container JSON path: pass, fail → rollback, unknown → escalation
 """
 
 import sys
@@ -30,6 +32,7 @@ from rewind_sdk.verification import (
     VerificationResult,
     VerificationStatus,
     VerifierConfig,
+    parse_verifier_output,
 )
 
 
@@ -43,12 +46,20 @@ class FakeEngine:
     def __init__(self):
         self.checkpoint_history = []
         self.rolled_back_to = None
+        self._stdout = ""
+        self._stderr = ""
+        self._returncode = 1
 
     def load_metadata(self):
         return True
 
     def run_cmd(self, cmd):
-        raise RuntimeError(f"Command failed: {cmd}")
+        if self._returncode != 0:
+            raise RuntimeError(f"Command failed: {cmd}")
+        return self._stdout.strip()
+
+    def run_cmd_capturing(self, cmd, timeout=None):
+        return self._stdout, self._stderr, self._returncode
 
     def create_checkpoint(self, label):
         self.checkpoint_history.append(label)
@@ -117,10 +128,7 @@ def test_verifier_recovers_on_retry(monkeypatch):
     session.memory.snapshot("good")
     engine.checkpoint_history.append("good")
 
-    session.auto_rollback("test_failure", to="good")
-
-    # Attach a verifier that recovers on the third attempt.
-    session._auto_rollback.verifier = _verifier_config(retries=3, retry_delay=0.0)
+    session.auto_rollback("test_failure", to="good", verifier=_verifier_config(retries=3, retry_delay=0.0))
 
     monkeypatch.setattr(
         _session_module,
@@ -158,8 +166,7 @@ def test_exhausted_retries_continue_resolution(monkeypatch):
 
     session.memory.snapshot("good")
     engine.checkpoint_history.append("good")
-    session.auto_rollback("test_failure", to="good")
-    session._auto_rollback.verifier = _verifier_config(retries=2, retry_delay=0.0)
+    session.auto_rollback("test_failure", to="good", verifier=_verifier_config(retries=2, retry_delay=0.0))
 
     monkeypatch.setattr(
         _session_module,
@@ -193,8 +200,7 @@ def test_exhausted_retries_rollback_resolution(monkeypatch):
 
     session.memory.snapshot("good")
     engine.checkpoint_history.append("good")
-    session.auto_rollback("test_failure", to="good")
-    session._auto_rollback.verifier = _verifier_config(retries=1, retry_delay=0.0)
+    session.auto_rollback("test_failure", to="good", verifier=_verifier_config(retries=1, retry_delay=0.0))
 
     monkeypatch.setattr(
         _session_module,
@@ -230,8 +236,7 @@ def test_exhausted_retries_stop_resolution(monkeypatch):
 
     session.memory.snapshot("good")
     engine.checkpoint_history.append("good")
-    session.auto_rollback("test_failure", to="good")
-    session._auto_rollback.verifier = _verifier_config(retries=1, retry_delay=0.0)
+    session.auto_rollback("test_failure", to="good", verifier=_verifier_config(retries=1, retry_delay=0.0))
 
     monkeypatch.setattr(
         _session_module,
@@ -268,8 +273,7 @@ def test_ledger_survives_rollback(monkeypatch):
 
     session.memory.snapshot("stable")
     engine.checkpoint_history.append("stable")
-    session.auto_rollback("test_failure", to="stable")
-    session._auto_rollback.verifier = _verifier_config(retries=0, retry_delay=0.0)
+    session.auto_rollback("test_failure", to="stable", verifier=_verifier_config(retries=0, retry_delay=0.0))
 
     monkeypatch.setattr(
         _session_module,
@@ -327,3 +331,134 @@ def test_backward_compat_no_verifier():
     # records the event).
     entries = session.ledger.history()
     assert any(e.event_type == "rollback" for e in entries)
+
+
+def test_auto_rollback_verifier_kwarg():
+    """verifier= on auto_rollback() is stored on the public config object."""
+    session, _engine = _make_session()
+    config = _verifier_config(command="python3 verify.py", retries=1)
+    session.auto_rollback("test_failure", to="good", test_command="python3 verify.py", verifier=config)
+    assert session._auto_rollback.verifier is config
+    assert session._auto_rollback.verifier.command == "python3 verify.py"
+    assert session._auto_rollback.test_command == "python3 verify.py"
+
+
+# ---------------------------------------------------------------------------
+# parse_verifier_output unit tests
+# ---------------------------------------------------------------------------
+
+def test_parse_verifier_output_pass():
+    result = parse_verifier_output('{"status": "pass"}', "")
+    assert result.status == VerificationStatus.PASS
+    assert result.raw_output == {"status": "pass"}
+
+
+def test_parse_verifier_output_fail():
+    result = parse_verifier_output('{"status": "fail", "errors": ["boom"]}', "")
+    assert result.status == VerificationStatus.FAIL
+    assert result.raw_output["errors"] == ["boom"]
+
+
+def test_parse_verifier_output_unknown_bad_json():
+    result = parse_verifier_output("not json at all", "stderr noise")
+    assert result.status == VerificationStatus.UNKNOWN
+    assert result.raw_output["raw_stdout"] == "not json at all"
+    assert result.raw_output["raw_stderr"] == "stderr noise"
+    assert result.notes is not None
+
+
+# ---------------------------------------------------------------------------
+# In-container JSON verifier path (run_tests)
+# ---------------------------------------------------------------------------
+
+def _make_verified_session(engine, escalation_handler=None):
+    """Session with auto-rollback + verifier configured and a known-good checkpoint."""
+    session = rewind_sdk.RewindSession(
+        engine=engine,
+        destroy_on_exit=False,
+        escalation_handler=escalation_handler,
+    )
+    session._started = True
+    session.memory.snapshot("good")
+    engine.checkpoint_history.append("good")
+    session.auto_rollback(
+        "test_failure",
+        to="good",
+        test_command="pytest",
+        verifier=_verifier_config(retries=0, retry_delay=0.0),
+    )
+    return session
+
+
+def test_run_tests_json_only_pass(monkeypatch):
+    """
+    Verifier configured: in-container stdout is valid JSON pass.
+    No rollback; host-side run_verifier is never invoked.
+    """
+    engine = FakeEngine()
+    engine._stdout = '{"status": "pass"}'
+    engine._returncode = 0
+    session = _make_verified_session(engine)
+
+    def _fail_if_called(_config):
+        raise AssertionError("run_verifier should not be called for in-container JSON path")
+
+    monkeypatch.setattr(_session_module, "run_verifier", _fail_if_called)
+
+    output = session.run_tests("pytest")
+
+    assert output == '{"status": "pass"}'
+    assert engine.rolled_back_to is None
+    assert session.last_auto_rollback is None
+
+
+def test_run_tests_json_only_fail():
+    """
+    Verifier configured: in-container stdout is valid JSON fail.
+    Rollback is triggered without re-running the verifier on the host.
+    """
+    engine = FakeEngine()
+    engine._stdout = '{"status": "fail", "errors": ["assertion failed"]}'
+    engine._returncode = 1
+    session = _make_verified_session(engine)
+
+    with pytest.raises(RuntimeError):
+        session.run_tests("pytest")
+
+    assert engine.rolled_back_to == "good"
+    assert session.last_auto_rollback is not None
+    assert session.last_auto_rollback["event"] == "test_failure"
+
+    entries = session.ledger.history()
+    assert len(entries) == 2
+    verification = next(e for e in entries if e.event_type == "verification")
+    assert verification.status == "fail"
+    assert "rollback" in [e.event_type for e in entries]
+
+
+def test_run_tests_json_only_unknown_escalates(monkeypatch):
+    """
+    Verifier configured: in-container stdout is not valid JSON.
+    UNKNOWN is escalated via the handler; no rollback when handler returns CONTINUE.
+    """
+    engine = FakeEngine()
+    engine._stdout = "pytest: 3 failed"
+    engine._stderr = "traceback..."
+    engine._returncode = 1
+    session = _make_verified_session(engine, escalation_handler=_always_unknown_handler)
+
+    def _fail_if_called(_config):
+        raise AssertionError("run_verifier should not be called for in-container JSON path")
+
+    monkeypatch.setattr(_session_module, "run_verifier", _fail_if_called)
+
+    with pytest.raises(RuntimeError):
+        session.run_tests("pytest")
+
+    assert engine.rolled_back_to is None
+
+    entries = session.ledger.history()
+    assert len(entries) == 1
+    assert entries[0].event_type == "escalation"
+    assert entries[0].status == "unknown"
+    assert entries[0].resolution == "continue"

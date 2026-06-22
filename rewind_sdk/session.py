@@ -186,9 +186,15 @@ class RewindSession:
         self._auto_checkpoint = AutoCheckpointConfig(trigger=trigger, keep_last=keep_last)
         return self
 
-    def auto_rollback(self, *events, on=None, to=None, test_command=None):
+    def auto_rollback(self, *events, on=None, to=None, test_command=None, verifier=None):
         """Configure automatic rollback behavior on specified events.
-        IMPORTANT: 
+
+        When ``verifier`` is set, ``run_tests()`` and test-like ``run()`` calls
+        execute ``test_command`` in the sandbox once and treat JSON stdout as the
+        authoritative pass/fail/unknown signal. ``VerifierConfig`` controls retries,
+        timeout, and escalation; ``test_command`` is the in-container command.
+
+        IMPORTANT:
         `to` should almost always be an explicit checkpoint label you
         created with `session.checkpoint(...)` BEFORE the operation began
         (for example to="pre_migration"), not the default "latest" auto-checkpoint.
@@ -224,6 +230,7 @@ class RewindSession:
             events=selected_events,
             to=to,
             test_command=test_command,
+            verifier=verifier,
         )
         return self
 
