@@ -529,6 +529,105 @@ def test_tool_decorator_propagates_halt_error():
         _invoke_tool(halt_tool)
 
 
+def _session_with_exception_rollback(label="good"):
+    """Session with auto_rollback on exception targeting a known checkpoint."""
+    session, engine = _make_session()
+    session._started = True
+    session.memory.snapshot(label)
+    engine.checkpoint_history.append(label)
+    session.auto_rollback("exception", to=label)
+    return session, engine
+
+
+def test_tool_rollback_on_error_false_no_rollback():
+    """
+    RuntimeError inside a rollback_on_error=False tool must not trigger
+    auto-rollback even when auto_rollback("exception") is configured.
+    """
+    session, engine = _session_with_exception_rollback()
+
+    @session.tool(rollback_on_error=False)
+    def failing_sql():
+        """Run a read-only SQL query (rollback suppressed on failure)."""
+        session.run("SELECT bad")
+
+    _invoke_tool(failing_sql)
+
+    assert engine.rolled_back_to is None
+    assert session.last_auto_rollback is None
+
+
+def test_tool_rollback_on_error_true_triggers_rollback():
+    """
+    RuntimeError inside a rollback_on_error=True tool triggers auto-rollback
+    when auto_rollback("exception") is configured.
+    """
+    session, engine = _session_with_exception_rollback()
+
+    @session.tool(rollback_on_error=True)
+    def failing_script():
+        """Run a state-changing script (rollback enabled on failure)."""
+        session.run("bad-script")
+
+    _invoke_tool(failing_script)
+
+    assert engine.rolled_back_to == "good"
+    assert session.last_auto_rollback is not None
+    assert session.last_auto_rollback["event"] == "exception"
+
+
+def test_rollback_notice_in_error_string():
+    """When rollback fires inside a tool, the returned error string includes [REWIND]."""
+    session, engine = _session_with_exception_rollback(label="pre_migration")
+
+    @session.tool
+    def failing_script():
+        """Run a script that fails and triggers rollback."""
+        session.run("bad-script")
+
+    result = _invoke_tool(failing_script)
+
+    assert result.startswith("ERROR:")
+    assert "[REWIND]" in result
+    assert "pre_migration" in result
+    assert engine.rolled_back_to == "pre_migration"
+
+
+def test_noop_guard_skips_second_rollback():
+    """Second rollback to the same checkpoint must not call engine.rollback again."""
+    session, engine = _session_with_exception_rollback()
+
+    rollback_calls = []
+
+    def tracking_rollback(label):
+        rollback_calls.append(label)
+        engine.rolled_back_to = label
+
+    engine.rollback_to_checkpoint = tracking_rollback
+
+    session._maybe_auto_rollback("exception", patch_notes="first")
+    assert len(rollback_calls) == 1
+
+    result = session._maybe_auto_rollback("exception", patch_notes="second")
+    assert result is None
+    assert len(rollback_calls) == 1
+
+
+def test_noop_guard_ledger_entry():
+    """Skipped duplicate rollback is recorded in the ledger as skipped_noop."""
+    session, _engine = _session_with_exception_rollback()
+
+    session._maybe_auto_rollback("exception", patch_notes="first")
+    session._maybe_auto_rollback("exception", patch_notes="second")
+
+    entries = session.ledger.history()
+    noop_entries = [e for e in entries if e.status == "skipped_noop"]
+    assert len(noop_entries) == 1
+    assert noop_entries[0].event_type == "rollback"
+    assert noop_entries[0].checkpoint == "good"
+    assert noop_entries[0].resolution is None
+
+
 # ---------------------------------------------------------------------------
 # format_verification_result unit tests
 # ---------------------------------------------------------------------------
