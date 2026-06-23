@@ -127,7 +127,7 @@ def test_verifier_recovers_on_retry():
 
     output = session.run_tests()
 
-    assert output == '{"status": "pass"}'
+    assert output == "Verification passed."
     assert engine.rolled_back_to is None
     assert session.last_auto_rollback is None
 
@@ -331,7 +331,7 @@ def test_run_tests_json_only_pass():
 
     output = session.run_tests()
 
-    assert output == '{"status": "pass"}'
+    assert output == "Verification passed."
     assert engine.rolled_back_to is None
     assert session.last_auto_rollback is None
 

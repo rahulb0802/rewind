@@ -17,6 +17,7 @@ from .verification import (
     VerificationResult,
     VerificationStatus,
     Verifier,
+    format_verification_result,
     parse_verifier_output,
     stdin_escalation_handler,
     stop_escalation_handler,
@@ -145,7 +146,9 @@ class RewindSession:
         )
         self._ensure_ready()
         if self._auto_rollback and self._auto_rollback.verifier:
-            return self._run_verified_container_cmd(command, "test_failure")
+            raw_stdout = self._run_verified_container_cmd(command, "test_failure")
+            result = parse_verifier_output(raw_stdout, "")
+            return format_verification_result(result)
         return self.engine.run_cmd(command)
 
     def write_file(self, path, content):
