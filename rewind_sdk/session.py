@@ -1,3 +1,4 @@
+import functools
 import os
 import subprocess
 import time
@@ -251,6 +252,37 @@ class RewindSession:
             self._remember_auto_label(label)
             return label
         return None
+
+    def tool(self, fn=None, *, name=None):
+        """Decorator: wraps fn as a LangChain tool with automatic session bookkeeping.
+
+        - Calls on_tool_call() before fn executes (auto-checkpoint + memory sync).
+        - Passes VerificationHaltError through uncaught — halt is a session-level signal.
+        - Converts RuntimeError to an error string the LLM can read and act on.
+        - Other exceptions propagate normally.
+        """
+        def decorator(func):
+            tool_name = name or func.__name__
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                self.on_tool_call(tool_name=tool_name)
+                try:
+                    return func(*args, **kwargs)
+                except VerificationHaltError:
+                    raise
+                except RuntimeError as exc:
+                    return f"ERROR: {exc}"
+
+            try:
+                from langchain_core.tools import tool as lc_tool
+                return lc_tool(wrapper)
+            except ImportError:
+                return wrapper
+
+        if fn is not None:
+            return decorator(fn)
+        return decorator
 
     def on_tool_result(self, messages=None, error=None):
         if messages is not None:
