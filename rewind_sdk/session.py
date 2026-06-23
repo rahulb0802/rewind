@@ -77,6 +77,9 @@ class RewindSession:
         # Durable ledger: lives outside both engine and memory rollback scopes.
         # rollback() never touches this attribute.
         self.ledger = VerificationLedger()
+        self._rollback_suppressed: bool = False
+        self._pending_rollback_notice: str | None = None
+        self._last_rollback_to: str | None = None
 
     def __enter__(self):
         self.start(force=True)
@@ -306,6 +309,11 @@ class RewindSession:
                 "or call session.start()."
             )
         self._started = True
+
+    def _consume_pending_rollback_notice(self) -> str | None:
+        notice = self._pending_rollback_notice
+        self._pending_rollback_notice = None
+        return notice
 
     def _resolve_label(self, label):
         if label != "latest":
