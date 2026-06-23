@@ -18,7 +18,10 @@ from .verification import (
     Verifier,
     parse_verifier_output,
     stdin_escalation_handler,
+    stop_escalation_handler,
 )
+
+VALID_MODES = {"interactive", "agent"}
 
 
 @dataclass
@@ -47,8 +50,11 @@ class RewindSession:
         memory=None,
         destroy_on_exit=True,
         auto_commit=False,
+        mode: str = "interactive",
         escalation_handler: EscalationHandler | None = None,
     ):
+        if mode not in VALID_MODES:
+            raise ValueError(f"mode must be one of {VALID_MODES!r}, got {mode!r}")
         self.name = container_name or name
         self.workspace = workspace
         self.engine = engine or SandboxEngine(container_name=self.name)
@@ -62,7 +68,10 @@ class RewindSession:
         self.last_auto_rollback = None
         self._started = False
         self.auto_commit = auto_commit
-        self._escalation_handler: EscalationHandler = escalation_handler or stdin_escalation_handler
+        self._mode = mode
+        self._preserve_on_halt = mode == "agent"
+        default_handler = stop_escalation_handler if mode == "agent" else stdin_escalation_handler
+        self._escalation_handler: EscalationHandler = escalation_handler or default_handler
         # Durable ledger: lives outside both engine and memory rollback scopes.
         # rollback() never touches this attribute.
         self.ledger = VerificationLedger()
@@ -72,8 +81,11 @@ class RewindSession:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        # Only auto-commit if the agent loop finished successfully
-        if exc_type is None and self.auto_commit:
+        is_halt = exc_type is not None and issubclass(exc_type, VerificationHaltError)
+        if is_halt:
+            print(f"[rewind] Session halted. Sandbox '{self.name}' is preserved for manual inspection.")
+            print(f"[rewind] Ledger: {len(self.ledger.history())} event(s) recorded.")
+        elif exc_type is None and self.auto_commit:
             try:
                 self.commit()
             except Exception as e:
@@ -83,8 +95,9 @@ class RewindSession:
                 f"Session '{self.name}' exited without auto_commit; no changes persisted to '{self.workspace}'.",
                 stacklevel=2,
             )
-                
-        if self.destroy_on_exit:
+
+        should_destroy = self.destroy_on_exit and not (is_halt and self._preserve_on_halt)
+        if should_destroy:
             self.destroy()
         return False
 
