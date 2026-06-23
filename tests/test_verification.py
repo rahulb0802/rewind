@@ -22,9 +22,13 @@ from rewind_sdk.verification import (
     EscalationContext,
     EscalationResolution,
     VerificationHaltError,
+    VerificationResult,
     VerificationStatus,
     Verifier,
+    format_verification_result,
     parse_verifier_output,
+    stdin_escalation_handler,
+    stop_escalation_handler,
 )
 
 
@@ -42,6 +46,8 @@ class FakeEngine:
         self._stderr = ""
         self._returncode = 1
         self._stdout_sequence: list[str] = []
+        self.destroyed = False
+        self.committed = False
 
     def load_metadata(self):
         return True
@@ -63,16 +69,43 @@ class FakeEngine:
     def rollback_to_checkpoint(self, label):
         self.rolled_back_to = label
 
+    def destroy_sandbox(self):
+        self.destroyed = True
 
-def _make_session(escalation_handler=None):
+    def commit(self, workspace):
+        self.committed = True
+
+
+def _make_session(escalation_handler=None, mode="interactive", **kwargs):
     """Return a session wired to FakeEngine with no escalation delay (retry_delay=0)."""
     engine = FakeEngine()
     session = rewind_sdk.RewindSession(
         engine=engine,
         destroy_on_exit=False,
         escalation_handler=escalation_handler,
+        mode=mode,
+        **kwargs,
     )
     return session, engine
+
+
+def _make_halt_error():
+    return VerificationHaltError(
+        "halted",
+        checkpoint="good",
+        verifier_command="fake",
+        last_result=VerificationResult(
+            status=VerificationStatus.UNKNOWN,
+            raw_output={},
+            notes="unknown",
+        ),
+    )
+
+
+def _invoke_tool(tool):
+    if hasattr(tool, "invoke"):
+        return tool.invoke({})
+    return tool()
 
 
 def _verifier_config(command="fake_verifier", retries=2, retry_delay=0.0):
@@ -381,3 +414,186 @@ def test_run_tests_json_only_unknown_escalates():
     assert entries[0].event_type == "escalation"
     assert entries[0].status == "unknown"
     assert entries[0].resolution == "continue"
+
+
+# ---------------------------------------------------------------------------
+# mode defaults
+# ---------------------------------------------------------------------------
+
+def test_mode_agent_sets_stop_handler():
+    session, _engine = _make_session(mode="agent")
+    assert session._escalation_handler is stop_escalation_handler
+
+
+def test_mode_interactive_uses_stdin_handler():
+    session, _engine = _make_session()
+    assert session._escalation_handler is stdin_escalation_handler
+
+
+def test_invalid_mode_raises():
+    with pytest.raises(ValueError, match="mode must be one of"):
+        rewind_sdk.RewindSession(mode="bad", destroy_on_exit=False)
+
+
+# ---------------------------------------------------------------------------
+# halt-aware __exit__
+# ---------------------------------------------------------------------------
+
+def test_exit_on_halt_preserves_sandbox_agent_mode():
+    engine = FakeEngine()
+    session = rewind_sdk.RewindSession(
+        engine=engine,
+        destroy_on_exit=True,
+        mode="agent",
+    )
+    session._started = True
+    halt = _make_halt_error()
+
+    session.__exit__(VerificationHaltError, halt, None)
+
+    assert engine.destroyed is False
+
+
+def test_exit_on_halt_destroys_in_interactive_mode():
+    engine = FakeEngine()
+    session = rewind_sdk.RewindSession(
+        engine=engine,
+        destroy_on_exit=True,
+        mode="interactive",
+    )
+    session._started = True
+    halt = _make_halt_error()
+
+    session.__exit__(VerificationHaltError, halt, None)
+
+    assert engine.destroyed is True
+
+
+def test_exit_on_halt_skips_commit():
+    engine = FakeEngine()
+    session = rewind_sdk.RewindSession(
+        engine=engine,
+        destroy_on_exit=False,
+        auto_commit=True,
+        mode="agent",
+    )
+    session._started = True
+    halt = _make_halt_error()
+
+    session.__exit__(VerificationHaltError, halt, None)
+
+    assert engine.committed is False
+
+
+# ---------------------------------------------------------------------------
+# @sandbox.tool decorator
+# ---------------------------------------------------------------------------
+
+def test_tool_decorator_injects_on_tool_call():
+    session, engine = _make_session()
+    session._started = True
+    session.auto_checkpoint(trigger="before_tool_call")
+
+    @session.tool
+    def my_tool():
+        return "ok"
+
+    _invoke_tool(my_tool)
+
+    assert len(engine.checkpoint_history) == 1
+
+
+def test_tool_decorator_converts_runtime_error():
+    session, _engine = _make_session()
+    session._started = True
+
+    @session.tool
+    def failing_tool():
+        raise RuntimeError("something broke")
+
+    result = _invoke_tool(failing_tool)
+
+    assert result == "ERROR: something broke"
+
+
+def test_tool_decorator_propagates_halt_error():
+    session, _engine = _make_session()
+    session._started = True
+    halt = _make_halt_error()
+
+    @session.tool
+    def halt_tool():
+        raise halt
+
+    with pytest.raises(VerificationHaltError):
+        _invoke_tool(halt_tool)
+
+
+# ---------------------------------------------------------------------------
+# format_verification_result unit tests
+# ---------------------------------------------------------------------------
+
+def test_format_verification_result_pass():
+    result = VerificationResult(VerificationStatus.PASS, {"summary": "All good"})
+    assert format_verification_result(result) == "All good"
+
+
+def test_format_verification_result_pass_default():
+    result = VerificationResult(VerificationStatus.PASS, {"status": "pass"})
+    assert format_verification_result(result) == "Verification passed."
+
+
+def test_format_verification_result_fail():
+    result = VerificationResult(
+        VerificationStatus.FAIL,
+        {"summary": "Failed", "errors": ["e1", "e2"]},
+    )
+    assert format_verification_result(result) == "Failed:\n  - e1\n  - e2"
+
+
+def test_format_verification_result_fail_no_errors():
+    result = VerificationResult(VerificationStatus.FAIL, {})
+    assert format_verification_result(result) == "Verification failed"
+
+
+def test_format_verification_result_unknown():
+    result = VerificationResult(
+        VerificationStatus.UNKNOWN,
+        {},
+        notes="Could not parse",
+    )
+    assert format_verification_result(result) == "Could not parse"
+
+
+# ---------------------------------------------------------------------------
+# run_tests formatted output
+# ---------------------------------------------------------------------------
+
+def test_run_tests_returns_human_string_pass():
+    engine = FakeEngine()
+    engine._stdout = '{"status": "pass", "summary": "3 tests passed"}'
+    engine._returncode = 0
+    session = _make_verified_session(engine)
+
+    output = session.run_tests()
+
+    assert output == "3 tests passed"
+    assert "{" not in output
+
+
+def test_run_tests_returns_human_string_fail():
+    """FAIL raises before return; verify the formatted string from parsed verifier stdout."""
+    raw = '{"status": "fail", "summary": "Tests failed", "errors": ["assertion failed"]}'
+    result = parse_verifier_output(raw, "")
+    formatted = format_verification_result(result)
+
+    assert formatted == "Tests failed:\n  - assertion failed"
+    assert "{" not in formatted
+
+    engine = FakeEngine()
+    engine._stdout = raw
+    engine._returncode = 1
+    session = _make_verified_session(engine)
+
+    with pytest.raises(RuntimeError):
+        session.run_tests()
