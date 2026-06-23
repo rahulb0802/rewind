@@ -153,6 +153,24 @@ class VerificationLedger:
         self.append(entry)
         return entry
 
+    def record_rollback_noop(
+        self,
+        *,
+        checkpoint: str | None,
+        notes: str | None,
+    ) -> LedgerEntry:
+        entry = LedgerEntry(
+            timestamp=self._now(),
+            event_type="rollback",
+            status="skipped_noop",
+            checkpoint=checkpoint,
+            raw_output={},
+            notes=notes,
+            resolution=None,
+        )
+        self.append(entry)
+        return entry
+
 
 # ---------------------------------------------------------------------------
 # Escalation protocol

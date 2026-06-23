@@ -249,6 +249,7 @@ class RewindSession:
         return self
 
     def on_tool_call(self, messages=None, tool_name=None):
+        self._last_rollback_to = None
         if messages is not None:
             self.sync_memory(messages)
 
@@ -469,6 +470,13 @@ class RewindSession:
         except ValueError:
             checkpoint_label = None
 
+        if checkpoint_label is not None and self._last_rollback_to == checkpoint_label:
+            self.ledger.record_rollback_noop(
+                checkpoint=checkpoint_label,
+                notes="Already at target checkpoint; rollback skipped.",
+            )
+            return None
+
         try:
             messages = self.rollback(
                 self._auto_rollback.to,
@@ -487,6 +495,12 @@ class RewindSession:
         self.ledger.record_rollback(
             checkpoint=checkpoint_label,
             notes=patch_notes or f"Automatic rollback triggered by {event}.",
+        )
+        self._last_rollback_to = checkpoint_label
+        self._pending_rollback_notice = (
+            f"[REWIND] The environment was automatically rolled back to checkpoint "
+            f"'{checkpoint_label}'. All filesystem changes made since that checkpoint "
+            f"have been discarded."
         )
         self.last_auto_rollback = {
             "event": event,
