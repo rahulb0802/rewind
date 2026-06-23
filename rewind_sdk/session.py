@@ -259,12 +259,15 @@ class RewindSession:
             return label
         return None
 
-    def tool(self, fn=None, *, name=None):
+    def tool(self, fn=None, *, name=None, rollback_on_error: bool = True):
         """Decorator: wraps fn as a LangChain tool with automatic session bookkeeping.
 
         - Calls on_tool_call() before fn executes (auto-checkpoint + memory sync).
         - Passes VerificationHaltError through uncaught — halt is a session-level signal.
         - Converts RuntimeError to an error string the LLM can read and act on.
+        - When ``rollback_on_error`` is True (default), automatic rollback on
+          ``"exception"`` events applies to failures inside this tool; set to
+          False to suppress rollback for read-only or side-effect-free tools.
         - Other exceptions propagate normally.
         """
         def decorator(func):
@@ -273,12 +276,17 @@ class RewindSession:
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 self.on_tool_call(tool_name=tool_name)
+                prev = self._rollback_suppressed
+                self._rollback_suppressed = not rollback_on_error
                 try:
                     return func(*args, **kwargs)
                 except VerificationHaltError:
                     raise
                 except RuntimeError as exc:
-                    return f"ERROR: {exc}"
+                    notice = self._consume_pending_rollback_notice()
+                    return f"ERROR: {exc}\n{notice}" if notice else f"ERROR: {exc}"
+                finally:
+                    self._rollback_suppressed = prev
 
             try:
                 from langchain_core.tools import tool as lc_tool
@@ -353,6 +361,8 @@ class RewindSession:
         return {str(event) for event in selected}
 
     def _maybe_auto_rollback(self, event, patch_notes=None, *, _pre_result=None, _pre_attempts=1):
+        if self._rollback_suppressed:
+            return None
         if not self._auto_rollback or event not in self._auto_rollback.events:
             return None
 
