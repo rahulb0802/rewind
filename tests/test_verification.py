@@ -593,9 +593,27 @@ def test_rollback_notice_in_error_string():
     assert engine.rolled_back_to == "pre_migration"
 
 
+def test_noop_guard_skips_exception_rollback_at_checkpoint_head():
+    """Exception rollback is a noop when already at the target checkpoint head."""
+    session, engine = _session_with_exception_rollback(label="pre_migration")
+
+    with pytest.raises(RuntimeError):
+        session.run("python3 nonexistent_script.py")
+
+    assert engine.rolled_back_to is None
+    assert session.last_auto_rollback is None
+
+    entries = session.ledger.history()
+    noop_entries = [e for e in entries if e.status == "skipped_noop"]
+    assert len(noop_entries) == 1
+    assert noop_entries[0].checkpoint == "pre_migration"
+
+
 def test_noop_guard_skips_second_rollback():
     """Second rollback to the same checkpoint must not call engine.rollback again."""
     session, engine = _session_with_exception_rollback()
+    session.memory.snapshot("good_later")
+    engine.checkpoint_history.append("good_later")
 
     rollback_calls = []
 
@@ -615,7 +633,9 @@ def test_noop_guard_skips_second_rollback():
 
 def test_noop_guard_ledger_entry():
     """Skipped duplicate rollback is recorded in the ledger as skipped_noop."""
-    session, _engine = _session_with_exception_rollback()
+    session, engine = _session_with_exception_rollback()
+    session.memory.snapshot("good_later")
+    engine.checkpoint_history.append("good_later")
 
     session._maybe_auto_rollback("exception", patch_notes="first")
     session._maybe_auto_rollback("exception", patch_notes="second")

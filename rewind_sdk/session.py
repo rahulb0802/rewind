@@ -80,6 +80,7 @@ class RewindSession:
         self._rollback_suppressed: bool = False
         self._pending_rollback_notice: str | None = None
         self._last_rollback_to: str | None = None
+        self._in_tool_execution: bool = False
 
     def __enter__(self):
         self.start(force=True)
@@ -90,6 +91,7 @@ class RewindSession:
         if is_halt:
             print(f"[rewind] Session halted. Sandbox '{self.name}' is preserved for manual inspection.")
             print(f"[rewind] Ledger: {len(self.ledger.history())} event(s) recorded.")
+            print(f"[DEBUG] container_name={getattr(self.engine, 'container_name', 'NOT FOUND')}")
         elif exc_type is None and self.auto_commit:
             try:
                 self.commit()
@@ -279,6 +281,8 @@ class RewindSession:
                 self.on_tool_call(tool_name=tool_name)
                 prev = self._rollback_suppressed
                 self._rollback_suppressed = not rollback_on_error
+                prev_in_tool = self._in_tool_execution
+                self._in_tool_execution = True
                 try:
                     return func(*args, **kwargs)
                 except VerificationHaltError:
@@ -287,6 +291,7 @@ class RewindSession:
                     notice = self._consume_pending_rollback_notice()
                     return f"ERROR: {exc}\n{notice}" if notice else f"ERROR: {exc}"
                 finally:
+                    self._in_tool_execution = prev_in_tool
                     self._rollback_suppressed = prev
 
             try:
@@ -463,6 +468,25 @@ class RewindSession:
             f"Details: {patch_notes}"
         )
 
+    def _should_skip_rollback_as_noop(self, checkpoint_label, event):
+        """Return True when rolling back would be redundant."""
+        if checkpoint_label is None:
+            return False
+        if self._last_rollback_to == checkpoint_label:
+            return True
+        # Direct session.run() failures while already at an explicit rollback
+        # target are no-ops; tool execution and to="latest" may still need to
+        # reset the writable layer even when the checkpoint head matches.
+        if (
+            event == "exception"
+            and self._auto_rollback.to != "latest"
+            and not self._in_tool_execution
+            and self.engine.checkpoint_history
+            and self.engine.checkpoint_history[-1] == checkpoint_label
+        ):
+            return True
+        return False
+
     def _execute_rollback(self, event, patch_notes, result=None):
         """Perform the actual filesystem + memory rollback and update session state."""
         try:
@@ -470,7 +494,7 @@ class RewindSession:
         except ValueError:
             checkpoint_label = None
 
-        if checkpoint_label is not None and self._last_rollback_to == checkpoint_label:
+        if self._should_skip_rollback_as_noop(checkpoint_label, event):
             self.ledger.record_rollback_noop(
                 checkpoint=checkpoint_label,
                 notes="Already at target checkpoint; rollback skipped.",
