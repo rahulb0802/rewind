@@ -51,11 +51,15 @@ These are implemented and covered by the test suite or directly traceable in sou
 - **OverlayFS checkpoints** — instant, layer-based snapshots of the sandbox filesystem (`engine.py`)
 - **Paired memory rollback** — message history is truncated to match a filesystem checkpoint in one call
 - **Dangling tool-call cleanup** — if the checkpoint point falls right after an assistant message that initiated a tool call, that message is automatically dropped too, so you don't hand a broken message history back to a strict-schema provider
-- **Auto-checkpoint before tool calls** — `on_tool_call()` snapshots state automatically when wired into your tool functions
-- **Auto-rollback on exception or test failure** — `auto_rollback("exception", "test_failure", ...)` triggers a rollback automatically inside `run()` / `run_tests()` and inside LangGraph's `invoke`/`stream`
-- **Two-phase commit to host** — host files are only touched if a session block exits without raising and `auto_commit=True` is set; otherwise nothing is written back
-- **LangGraph adapter** — `wrap_langgraph()` wraps a compiled graph's `invoke`/`stream` to keep memory synced and to trigger rollback on unhandled exceptions
-- **CLI and MCP server** — `rewind_cli.py` and `mcp_server.py` expose the same session operations as a command-line tool and as MCP tools, respectively
+- **Auto-checkpoint before tool calls** — `on_tool_call()` snapshots state automatically; `@session.tool` injects this for decorated tools
+- **Auto-rollback on exception or test failure** — `auto_rollback("exception", "test_failure", ...)` triggers rollback inside `run()` / `run_tests()` and LangGraph's `invoke`/`stream`; per-tool scoping via `rollback_on_error`
+- **JSON verifier contract** — `run_tests()` runs a verifier in-container, parses `{"status": "pass"|"fail"|"unknown"}` from stdout, retries on UNKNOWN, and returns a human-readable summary on PASS
+- **Verification ledger** — append-only audit log of verification, escalation, and rollback events; survives `rollback()` calls
+- **Escalation on UNKNOWN** — after retries are exhausted, `mode="interactive"` prompts continue/rollback/stop on stdin; `mode="agent"` halts with `VerificationHaltError` and preserves the container
+- **`@session.tool` decorator** — LangChain-compatible tools with automatic checkpointing, scoped exception rollback, and `RuntimeError` → error-string conversion for the LLM
+- **Two-phase commit to host** — host files are only touched if a session block exits without raising and `auto_commit=True` is set; halt-aware `__exit__` skips commit and optionally preserves the container
+- **LangGraph adapter** — `wrap_langgraph()` keeps memory synced, re-raises `VerificationHaltError`, and triggers rollback on other unhandled exceptions
+- **CLI and MCP server** — `rewind_cli.py` and `mcp_server.py` expose session operations including verification ledger history
 
 ---
 
@@ -106,14 +110,18 @@ with session("agent", workspace="./workspace") as sess:
 ### Checkpoint and roll back
 
 ```python
+from rewind_sdk import session, Verifier
+
 with session("agent", workspace="./src", auto_commit=True) as sess:
     sess.checkpoint("stable")
 
     sess.write_file("config.py", risky_change)
+    sess.auto_rollback("exception", "test_failure", to="stable",
+                       verifier=Verifier(command="pytest"))
     try:
-        sess.run_tests()  # raises RuntimeError on non-zero exit, e.g. pytest failure
+        sess.run_tests()  # PASS: formatted summary; FAIL: RuntimeError + auto-rollback
     except RuntimeError:
-        sess.rollback("stable")
+        pass  # already rolled back to "stable"
 ```
 
 ### Sync conversation memory
@@ -140,7 +148,7 @@ sess.auto_checkpoint(trigger="before_tool_call", keep_last=10)
 
 `trigger="before_tool_call"` is the only trigger currently implemented. `keep_last` trims the SDK's own convenience label history (`_auto_labels`), but does **not** delete the underlying OverlayFS checkpoint layers, which remain on disk regardless of this setting. If you're watching container disk usage, this parameter won't help; there's currently no automatic checkpoint-layer pruning.
 
-Auto-checkpoints only fire where you explicitly call `sess.on_tool_call(...)`, typically from inside your own tool functions, or via the LangGraph adapter's `before_tool_node` hook if you wire it into your graph. It is not a global hook that activates on every tool call without integration.
+Auto-checkpoints fire when you call `sess.on_tool_call(...)` or use `@session.tool`, which calls `on_tool_call()` automatically before each decorated tool runs. You can also wire the LangGraph adapter's `before_tool_node` hook into a custom graph. It is not a global hook that activates on every tool call without one of these integrations.
 
 ### Auto-rollback
 
@@ -203,6 +211,114 @@ failures inside that tool:
   read-only or side-effect-free operations where a failure should not discard
   other work in the sandbox.
 
+`VerificationHaltError` (raised when a verifier returns UNKNOWN and escalation
+resolves STOP) always propagates uncaught through `@session.tool` — it is a
+session-level halt signal, not a tool error string.
+
+Duplicate rollbacks to the same checkpoint are skipped automatically and
+recorded in the ledger as `skipped_noop`.
+
+---
+
+## Verification and escalation
+
+### Three-state verifier contract
+
+When a `Verifier` is configured via `auto_rollback(...)`, `run_tests()` runs
+`verifier.command` in the container and treats **JSON stdout** as the sole
+verdict (process exit code is ignored):
+
+```json
+{"status": "pass", "summary": "All checks passed."}
+{"status": "fail", "summary": "2 check(s) failed", "errors": ["..."]}
+{"status": "unknown", "summary": "Verifier crashed", "error": "..."}
+```
+
+| Status | Behavior |
+|--------|----------|
+| **pass** | No rollback; ledger records verification; `run_tests()` returns a formatted summary string |
+| **fail** | Auto-rollback to `to=` checkpoint; `run_tests()` raises `RuntimeError` (or `@session.tool` converts it to an error string the LLM can act on) |
+| **unknown** | Retried up to `verifier.retries` times; if still unknown, escalation runs (see below) |
+
+```python
+from rewind_sdk import Verifier
+
+sess.auto_rollback(
+    "exception",
+    "test_failure",
+    to="known_good",
+    verifier=Verifier(command="python3 verify.py", retries=2, retry_delay=1.0, timeout=30.0),
+)
+
+summary = sess.run_tests()  # human-readable string on PASS
+```
+
+### Verification ledger
+
+`session.ledger` is an append-only record of verification, escalation, and
+rollback events. It lives **outside** the rollback scope — `rollback()` never
+touches it.
+
+```python
+for entry in sess.ledger.history():
+    print(entry.event_type, entry.status, entry.resolution, entry.checkpoint)
+```
+
+### Session modes and escalation
+
+```python
+# Interactive (default): prompts [c]ontinue / [r]ollback / [s]top on stdin after UNKNOWN
+sess = session("dev", workspace="./src")
+
+# Agent / headless: UNKNOWN → STOP automatically; container preserved on halt
+sess = session("agent", workspace="./src", mode="agent")
+```
+
+Override the default handler explicitly if needed:
+
+```python
+from rewind_sdk import session, stdin_escalation_handler, stop_escalation_handler
+
+sess = session("custom", workspace="./src", escalation_handler=stdin_escalation_handler)
+```
+
+Escalation resolutions:
+
+- **continue** — proceed without trustworthy verification; ledger records the decision; `run_tests()` still raises (UNKNOWN is never treated as PASS)
+- **rollback** — revert to the `to=` checkpoint
+- **stop** — raise `VerificationHaltError`; in `mode="agent"`, `__exit__` preserves the container and skips `auto_commit`
+
+### Handling `VerificationHaltError` in agent apps
+
+Catch halt **outside** the `with session(...)` block so `__exit__` can run
+preserve-on-halt logic. Catching inside `with` and returning makes Python call
+`__exit__(None, None, None)`, which skips container preservation.
+
+```python
+from rewind_sdk import session, VerificationHaltError, wrap_langgraph
+
+sandbox = session("agent", workspace="./src", mode="agent", auto_commit=True)
+
+try:
+    with sandbox:
+        sandbox.checkpoint("known_good")
+        sandbox.auto_rollback("exception", "test_failure", to="known_good", verifier=...)
+
+        @sandbox.tool
+        def run_verify() -> str:
+            return sandbox.run_tests()
+
+        safe_agent = wrap_langgraph(agent, session=sandbox)
+        for event in safe_agent.stream({"messages": messages}):
+            ...
+
+except VerificationHaltError as exc:
+    print(exc)                              # halt details
+    print(exc.checkpoint)                   # checkpoint at time of halt
+    print(sandbox.engine.container_name)    # preserved container name
+    print(sandbox.ledger.history())         # audit trail
+```
+
 ---
 
 ## LangGraph Integration
@@ -211,33 +327,62 @@ Install with the LangGraph extra: `pip install "rewind-sdk[langgraph]"`
 
 ```python
 import threading
-from rewind_sdk import session, wrap_langgraph
+from rewind_sdk import session, Verifier, VerificationHaltError, wrap_langgraph
 
 tool_lock = threading.Lock()
-sandbox = session("agent_sandbox", workspace="./my_codebase", auto_commit=True)
+sandbox = session("agent_sandbox", workspace="./my_codebase", mode="agent", auto_commit=True)
 
-@tool
-def write_file(path: str, content: str) -> str:
-    with tool_lock:
-        sandbox.on_tool_call(tool_name="write_file")  # explicit checkpoint trigger
-        sandbox.write_file(path, content)
-        return f"Wrote to {path}"
+try:
+    with sandbox:
+        sandbox.auto_checkpoint(trigger="before_tool_call")
+        sandbox.checkpoint("known_good")
+        sandbox.auto_rollback(
+            "exception",
+            "test_failure",
+            to="known_good",
+            verifier=Verifier(command="pytest", retries=2, timeout=30.0),
+        )
 
-with sandbox:
-    sandbox.auto_checkpoint(trigger="before_tool_call")
-    sandbox.checkpoint("known_good")
-    sandbox.auto_rollback("exception", to="known_good")
+        @sandbox.tool(rollback_on_error=False)
+        def read_file(path: str) -> str:
+            """Read-only — query failures should not roll back other work."""
+            with tool_lock:
+                return sandbox.read_file(path)
 
-    safe_agent = wrap_langgraph(base_agent, session=sandbox)
-    for event in safe_agent.stream({"messages": messages}):
-        pass
+        @sandbox.tool
+        def write_file(path: str, content: str) -> str:
+            """State-changing — failures trigger exception rollback."""
+            with tool_lock:
+                sandbox.write_file(path, content)
+                return f"Wrote to {path}"
+
+        @sandbox.tool
+        def run_verify() -> str:
+            """Run the configured verifier; FAIL rolls back, UNKNOWN halts."""
+            with tool_lock:
+                return sandbox.run_tests()
+
+        agent = create_react_agent(llm, tools=[read_file, write_file, run_verify])
+        safe_agent = wrap_langgraph(agent, session=sandbox)
+        for event in safe_agent.stream({"messages": messages}):
+            ...
+
+except VerificationHaltError as exc:
+    # sandbox container is preserved in mode="agent"
+    ...
 ```
 
-Your system prompt doesn't need to mention rollbacks, checkpoints, or recovery, as the message-history correction happens in `memory.py`, not in the prompt. 
+`@sandbox.tool` injects `on_tool_call()` before each tool run, so you do not
+need to call it manually in decorated tools. `wrap_langgraph` keeps memory
+synced and re-raises `VerificationHaltError` uncaught; other unhandled
+exceptions trigger `"exception"` rollback via `on_tool_result`.
 
-However, checkpointing before each tool call still requires you to call `sandbox.on_tool_call(...)` inside your tool implementations, as shown above. The adapter keeps memory synced and catches unhandled exceptions from `invoke`/`stream`, but it does not instrument your tools for you.
+Your system prompt doesn't need to mention rollbacks, checkpoints, or recovery,
+as the message-history correction happens in `memory.py`, not in the prompt.
 
-A thread lock around tool execution is recommended (and used above) because the sandbox is a single container, as concurrent writes from parallel tool calls aren't serialized for you.
+A thread lock around tool execution is recommended because the sandbox is a
+single container; concurrent writes from parallel tool calls aren't serialized
+for you.
 
 ---
 
@@ -254,6 +399,8 @@ python rewind_cli.py checkpoint stable
 python rewind_cli.py exec "pytest"
 python rewind_cli.py rollback stable
 python rewind_cli.py status
+python rewind_cli.py ledger
+python rewind_cli.py ledger --checkpoint stable
 python rewind_cli.py destroy
 ```
 
@@ -264,7 +411,7 @@ Add `--json` for machine-readable output and `--quiet` to suppress stderr loggin
 > `mcp_server.py` is included in the GitHub repo, not the PyPI package. Clone
 > the repo to use it.
 
-`mcp_server.py` exposes session operations (`init_sandbox`, `execute_sandbox_command`, `write_sandbox_file`, `read_sandbox_file`, `sync_agent_memory`, `create_sandbox_checkpoint`, `rollback_sandbox_state`, `configure_auto_checkpoint`, `configure_auto_rollback`, `get_sandbox_status`) as MCP tools, for clients that want to drive a Rewind sandbox without writing Python. Install with MCP extra: `pip install "rewind-sdk[mcp]"`.
+`mcp_server.py` exposes session operations (`init_sandbox`, `execute_sandbox_command`, `write_sandbox_file`, `read_sandbox_file`, `sync_agent_memory`, `create_sandbox_checkpoint`, `rollback_sandbox_state`, `configure_auto_checkpoint`, `configure_auto_rollback`, `get_sandbox_status`, `get_ledger_history`) as MCP tools, for clients that want to drive a Rewind sandbox without writing Python. The MCP server uses `stop_escalation_handler` by default. Install with MCP extra: `pip install "rewind-sdk[mcp]"`.
 
 ---
 
@@ -275,10 +422,10 @@ Being direct and transparent (as this is still an early prototype):
 - **Containers run `--privileged`.** This is required for the current OverlayFS mounting approach, but it means the sandbox container has broad host-kernel access, and it is not a hardened security boundary against a determined adversary. Treat it as protection against an agent's *accidental* mistakes (bad refactors, destructive commands), not as isolation against malicious code.
 - **One framework integration.** Only LangGraph is supported today. The adapter pattern (`messages_to_dicts` / `dicts_to_messages`) is framework-agnostic in design, but no LangChain-only or CrewAI adapter exists yet.
 - **No automatic concurrency control inside the SDK.** If you call sandbox methods from multiple threads, you need your own lock (see the LangGraph example above); the SDK does not serialize for you.
-- **Auto-checkpoint requires manual wiring.** `on_tool_call()` needs to be called from your own tool code; it isn't injected automatically into arbitrary agent frameworks.
 - **Exception rollback is opt-in per tool.** With `@session.tool`, you choose per tool whether failures trigger `"exception"` rollback via `rollback_on_error`. Read-only tools should set `rollback_on_error=False` so a query failure does not roll back unrelated filesystem changes. Outside decorated tools, `sess.run()` still rolls back on failure when configured.
+- **`VerificationHaltError` must escape `with` uncaught.** Catch it outside the `with session(...)` block so `__exit__` can preserve the container in `mode="agent"`. Catching inside `with` and returning treats the exit as clean.
 - **`keep_last` doesn't free disk space.** It trims label bookkeeping, not the underlying checkpoint layers.
-- **Default behavior discards work.** With default arguments (`destroy_on_exit=True`, `auto_commit=False`), exiting a `with session(...)` block destroys the container and writes nothing back to the host. Pass `auto_commit=True` explicitly if you want results persisted.
+- **Default behavior discards work.** With default arguments (`destroy_on_exit=True`, `auto_commit=False`), exiting a `with session(...)` block destroys the container and writes nothing back to the host. Pass `auto_commit=True` explicitly if you want results persisted. Halt in `mode="agent"` is the exception: the container is preserved even with `destroy_on_exit=True`.
 - **Untested against multi-agent/complex tool calls.** The dangling-tool-call cleanup handles the single-message case (one assistant tool-call message immediately before the checkpoint). Behavior under deeper crash scenarios hasn't been verified.
 
 ---
@@ -287,12 +434,14 @@ Being direct and transparent (as this is still an early prototype):
 
 ```python
 session(name="rewind_sandbox", workspace=".", *, container_name=None,
-        engine=None, memory=None, destroy_on_exit=True, auto_commit=False)
+        engine=None, memory=None, destroy_on_exit=True, auto_commit=False,
+        mode="interactive", escalation_handler=None)
 
 sess.write_file(path, content)
 sess.read_file(path) -> str
 sess.run(cmd) -> str                  # raises RuntimeError on non-zero exit
-sess.run_tests(cmd=None) -> str       # uses verifier.command when cmd omitted
+sess.run_tests(cmd=None) -> str       # uses verifier.command when cmd omitted;
+                                      # returns formatted summary on PASS
 
 sess.sync_memory(messages, message_format="auto")
 sess.get_messages(message_format="auto") -> list
@@ -313,6 +462,30 @@ sess.attach()
 sess.destroy()
 sess.status() -> dict
 sess.commit()                         # manual host export; auto_commit calls this on clean exit
+
+sess.ledger                          # VerificationLedger (survives rollback)
+sess.get_ledger() -> VerificationLedger
+sess.last_auto_rollback              # dict after most recent auto-rollback, or None
+```
+
+### Verification exports
+
+```python
+from rewind_sdk import (
+    Verifier,
+    VerificationHaltError,
+    VerificationStatus,
+    VerificationResult,
+    VerificationLedger,
+    LedgerEntry,
+    EscalationContext,
+    EscalationResolution,
+    format_verification_result,
+    parse_verifier_output,
+    stdin_escalation_handler,
+    stop_escalation_handler,
+    wrap_langgraph,
+)
 ```
 
 ---
@@ -325,6 +498,9 @@ sess.commit()                         # manual host export; auto_commit calls th
 | `RuntimeError: Session not started` | Use `with session(...)` or call `.start()` first |
 | Work disappeared after the `with` block | Default `auto_commit=False`, pass `auto_commit=True` |
 | `"Checkpoint X already exists"` | Checkpoint labels must be unique per session; pick a new label |
+| Container destroyed after UNKNOWN halt | Catch `VerificationHaltError` **outside** `with session(...)`, not inside; use `mode="agent"` |
+| `run_tests()` raises but agent keeps going | FAIL inside `@session.tool` becomes an error string (by design); UNKNOWN raises `VerificationHaltError` at the session boundary |
+| Verifier always returns unknown | Ensure stdout is a single JSON object with a `"status"` field; use stderr for debug logs |
 
 ---
 
